@@ -16,6 +16,7 @@
 #include "hda_auto_parser.h"
 #include "hda_jack.h"
 #include "../generic.h"
+#include "patch_cirrus_a1534_headset.h"
 
 struct cs_spec {
 	struct hda_gen_spec gen;
@@ -44,6 +45,9 @@ struct cs_spec {
 	// till sometime after the first play
 	struct timespec64 first_play_time;
 	int playing;
+
+	/* A1534 headset microphone, see cs4208_hs_*() in patch_cirrus_a1534_pcm.h */
+	struct cs4208_hs hs;
 };
 
 /* available models with CS420x */
@@ -144,6 +148,7 @@ static void cs_automute(struct hda_codec *codec)
 		else
 			spec->gpio_data =
 				spec->gpio_eapd_hp | spec->gpio_eapd_speaker;
+		spec->gpio_data |= spec->hs.gpio_fets;
 		snd_hda_codec_write(codec, 0x01, 0,
 				    AC_VERB_SET_GPIO_DATA, spec->gpio_data);
 	}
@@ -731,6 +736,15 @@ static int cs4208_probe(struct hda_codec *codec)
 	/* exclude NID 0x10 (HP) from output volumes due to different steps */
 	spec->gen.out_vol_mask = 1ULL << 0x10;
 
+	/* As on the CS4206/4207, an ADC has one input amplifier whatever its
+	 * connection index.  Without this the amp cache holds one value per
+	 * index, "Capture" drives only the selected one and the others stay at
+	 * their initial mute; every regcache sync then writes them all and the
+	 * last one, a mute, is what the chip keeps.  Seen on ADC 0x07 (three
+	 * inputs): the headset microphone was digital silence.  (Found by Igor
+	 * Chicherin for the MacBookPro11,x.) */
+	codec->single_adc_amp = 1;
+
 	//mb9-specific
 	err = setup_a1534(codec);
 	err = play_a1534(codec);
@@ -741,6 +755,8 @@ static int cs4208_probe(struct hda_codec *codec)
 	snd_hda_pick_fixup(codec, cs4208_models, cs4208_fixup_tbl,
 			   cs4208_fixups);
 	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PRE_PROBE);
+
+	cs4208_hs_pre_probe(codec);
 
 	snd_hda_override_wcaps(codec, 0x18,
 			       get_wcaps(codec, 0x18) | AC_WCAP_STEREO);
@@ -753,6 +769,7 @@ static int cs4208_probe(struct hda_codec *codec)
 		return err;
 
 	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PROBE);
+	cs4208_hs_probe(codec);
 
 	return 0;
 }
@@ -796,8 +813,9 @@ static const struct hda_codec_ops cs_4208_codec_ops = {
 	.build_controls = cs_4208_build_controls_explicit,
 	.build_pcms = cs_4208_build_pcms_explicit,
 	.init = cs_4208_init_explicit,
-	.unsol_event = snd_hda_jack_unsol_event,
+	.unsol_event = cs_4208_unsol_event,
 	.stream_pm = snd_hda_gen_stream_pm,
+	.suspend = cs_4208_suspend,
 	.resume = cs_4208_resume,
 };
 

@@ -160,6 +160,7 @@ if (( major_version > 6 || (major_version == 6 && minor_version >= 17) )); then
   cp "$patch_dir/cs420x.c" \
     "$patch_dir/patch_cirrus_a1534_setup.h" \
     "$patch_dir/patch_cirrus_a1534_pcm.h" \
+    "$patch_dir/patch_cirrus_a1534_headset.h" \
     "$hda_dir/codecs/cirrus"
   cp "$patch_dir/$makefile_name" "$hda_dir/codecs/cirrus/Makefile"
 else
@@ -171,6 +172,7 @@ else
   cp "$patch_dir/patch_cirrus.c" \
     "$patch_dir/patch_cirrus_a1534_setup.h" \
     "$patch_dir/patch_cirrus_a1534_pcm.h" \
+    "$patch_dir/patch_cirrus_a1534_headset.h" \
     "$hda_dir"
   cp "$patch_dir/$makefile_name" "$hda_dir/Makefile"
 fi
