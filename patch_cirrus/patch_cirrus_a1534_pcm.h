@@ -330,6 +330,26 @@ void cs_4208_jack_unsol_event(struct hda_codec *codec, unsigned int res)
 
 #define cs_4208_free            snd_hda_gen_free
 
+/* headphones_a1534()/play_a1534() cycle the AFG through D3, which clears the
+ * stream id of the capture converters while the core's hda_cvt_setup cache
+ * still believes the tag is programmed. Re-arm the cache and, for a live
+ * capture stream, reprogram the converter so the mic keeps recording. */
+static void cs_4208_rearm_capture_cvt(struct hda_codec *codec, hda_nid_t nid)
+{
+	struct hda_cvt_setup *p = get_hda_cvt_setup_4208(codec, nid);
+	unsigned int tag, fmt;
+
+	if (!p)
+		return;
+	tag = p->stream_tag;
+	fmt = p->format_id;
+	p->stream_tag = 0; p->channel_id = 0; p->format_id = 0;
+	if (p->active && tag) {
+		codec_dbg(codec, "cs_4208_rearm_capture_cvt nid 0x%02x tag=%u fmt=0x%x", nid, tag, fmt);
+		snd_hda_codec_setup_stream(codec, nid, tag, 0, fmt);
+	}
+}
+
 /* Unsolicited HP-jack handler: re-route speaker<->headphone for a *running*
  * stream. Defined here (not at the top) because it needs get_hda_cvt_setup_4208
  * to invalidate the converter format cache before re-pointing the stream. */
@@ -347,6 +367,8 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 
 	if (hp) {				/* headphones plugged */
 		headphones_a1534(codec);
+		cs_4208_rearm_capture_cvt(codec, 0x06);	/* internal mic ADC */
+		cs_4208_rearm_capture_cvt(codec, 0x07);	/* external mic ADC */
 		if (cs4208_cur_stream_tag) {
 			/* Invalidate the cached converter setup so setup_stream
 			 * actually reprograms the live format - otherwise 0x02
@@ -365,6 +387,8 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 				    AC_VERB_SET_PIN_WIDGET_CONTROL, 0x00);
 	} else {				/* back to speakers */
 		play_a1534(codec);
+		cs_4208_rearm_capture_cvt(codec, 0x06);
+		cs_4208_rearm_capture_cvt(codec, 0x07);
 		if (cs4208_cur_stream_tag) {
 			p = get_hda_cvt_setup_4208(codec, 0x04);
 			p->stream_tag = 0; p->channel_id = 0; p->format_id = 0;
