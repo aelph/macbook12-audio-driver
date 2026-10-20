@@ -18,11 +18,17 @@
 
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
+#include <linux/input.h>
 
 static bool headset_mic = true;
 module_param(headset_mic, bool, 0444);
 MODULE_PARM_DESC(headset_mic,
 		 "CS4208 A1534: headset microphone in the combo jack (default=1)");
+
+static bool headset_buttons = true;
+module_param(headset_buttons, bool, 0444);
+MODULE_PARM_DESC(headset_buttons,
+		 "CS4208 A1534: headset remote buttons as media keys (default=1)");
 
 struct cs4208_hs {
 	struct hda_codec *codec;
@@ -31,6 +37,7 @@ struct cs4208_hs {
 	int (*exec_verb)(struct hdac_device *dev, unsigned int cmd,
 			 unsigned int flags, unsigned int *res);
 	unsigned int gpio_fets;		/* FET control lines driven high */
+	int btn_state;			/* SND_JACK_BTN_* currently pressed */
 	int type;			/* detector's verdict, -1 = unknown */
 	int retries;
 	unsigned int enabled:1;
@@ -38,6 +45,7 @@ struct cs4208_hs {
 	unsigned int detecting:1;	/* type detection is running */
 	unsigned int mic:1;		/* reported as presence of pin 0x18 */
 	unsigned int powered:1;		/* codec kept powered for the headset */
+	unsigned int buttons:1;		/* button reception is set up */
 };
 
 #endif /* PATCH_CIRRUS_A1534_HEADSET_H */

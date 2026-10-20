@@ -11,6 +11,7 @@ static int cs4208_cur_hp = -1;			/* last HP jack state (-1 = unknown) */
 /* headset detection (A1534 combo jack), defined further down as well */
 static void cs4208_hs_jack_update(struct hda_codec *codec, bool plugged,
 				  bool replay);
+static void cs4208_hs_bind_keys(struct hda_codec *codec);
 
 static int cs_4208_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 					struct hda_codec *codec,
@@ -275,6 +276,9 @@ static int cs_4208_build_controls_explicit(struct hda_codec *codec)
 	if (retval < 0)
 		return retval;
 
+	/* headset buttons as keys of the headphone jack */
+	cs4208_hs_bind_keys(codec);
+
 	codec_dbg(codec, "cs_4208_build_controls_explicit end");
 	return 0;
 }
@@ -393,6 +397,17 @@ static void cs_4208_rearm_capture_cvt(struct hda_codec *codec, hda_nid_t nid)
 #define CS4208_IDX_HP_CLAMP		0x0000	/* bit 13: headphone clamps off */
 #define CS4208_IDX_HS_DETECT		0x0019
 #define CS4208_IDX_HS_BIAS		0x001c
+#define CS4208_IDX_HS_BTN_CFG		0x001d
+#define CS4208_HS_BTN_IRQ_ENABLE	0xaf	/* value AppleHDA writes to 0x7f1 */
+/* bits of the unsolicited response with tag 0x2f (handleButtonDetectUR) */
+#define CS4208_HS_BTN_UR_BTN1		0x0002	/* Apple remote: volume down */
+#define CS4208_HS_BTN_UR_BTN2		0x0004	/* Apple remote: volume up */
+#define CS4208_HS_BTN_UR_BTN3		0x0008
+#define CS4208_HS_BTN_UR_BTN4		0x0010
+#define CS4208_HS_BTN_UR_RELEASE	0x0020	/* the pressed button released */
+#define CS4208_HS_BTN_UR_SHORT		0x0040	/* centre button: mic line shorted */
+#define CS4208_HS_BTN_UR_UNSHORT	0x0080	/* centre button released */
+#define CS4208_HS_BTN_UR_IDENTIFYING	0x0800	/* remote identification running: ignore */
 #define CS4208_HS_DETECT_DELAY		250	/* ms, "HeadsetRetryTimeout" */
 #define CS4208_HS_DETECT_TIMEOUT	1000	/* ms */
 #define CS4208_HS_MAX_RETRIES		4
@@ -456,6 +471,132 @@ static void cs4208_hs_keep_power(struct hda_codec *codec, bool on)
 		snd_hda_power_down_pm(codec);
 }
 
+/* Headset buttons.
+ *
+ * The headset block also decodes the Apple remote (the identification exchange
+ * over the microphone bias and the button presses) and reports it with the
+ * unsolicited tag 0x2f; this is AppleHDAMikeyInternalCS4208::setupButtonDetection
+ * and handleButtonDetectUR of AppleHDA 10.13.6, verified on a MacBook10,1 with
+ * Apple EarPods.  Button presses are reported as jack buttons of the headphone
+ * pin, which the generic jack code turns into key events. */
+static const struct hda_jack_keymap cs4208_hs_keymap[] = {
+	{ SND_JACK_BTN_0, KEY_PLAYPAUSE },
+	{ SND_JACK_BTN_1, KEY_VOLUMEUP },
+	{ SND_JACK_BTN_2, KEY_VOLUMEDOWN },
+	{}
+};
+
+/* enableHSBIASautoclamp(): bit 0x40 of the bias coefficient */
+static void cs4208_hs_bias_autoclamp(struct hda_codec *codec, bool on)
+{
+	if (on)
+		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0, 0x0142);
+	else
+		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0x0142, 0x0102);
+}
+
+/* setupButtonDetection(): called with the microphone on pin 0x18 (VREF80) */
+static void cs4208_hs_buttons_enable(struct hda_codec *codec)
+{
+	struct cs_spec *spec = codec->spec;
+
+	if (!headset_buttons || spec->hs.buttons)
+		return;
+	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0x1000, 0);
+	snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
+			    CS4208_VERB_HS_BTN_IRQ_MASK, CS4208_HS_BTN_IRQ_ENABLE);
+	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BTN_CFG, 0x3ffe, 0x0ff4);
+	cs4208_hs_bias_autoclamp(codec, false);
+	/* powerHSBIAS(0): bias off, ADC 0x07 fed from the pin */
+	snd_hda_codec_write(codec, CS4208_HS_MIC_PIN, 0,
+			    AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_IN);
+	snd_hda_codec_write(codec, 0x07, 0, AC_VERB_SET_CONNECT_SEL, 1);
+	msleep(20);
+	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0, 0x5000);
+	/* powerHSBIAS(0x50): bias from VREF80 again */
+	snd_hda_codec_write(codec, CS4208_HS_MIC_PIN, 0,
+			    AC_VERB_SET_PIN_WIDGET_CONTROL,
+			    PIN_IN | AC_PINCTL_VREF_80);
+	msleep(20);
+	cs4208_hs_bias_autoclamp(codec, true);
+	/* enableShortReleaseInterrupt(true) */
+	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0x4040, 0x4000);
+	snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
+			    CS4208_VERB_HS_BTN_IRQ_MASK, CS4208_HS_BTN_IRQ_ENABLE);
+	spec->hs.buttons = 1;
+	spec->hs.btn_state = 0;
+}
+
+/* disableButtonDetection() */
+static void cs4208_hs_buttons_disable(struct hda_codec *codec)
+{
+	struct cs_spec *spec = codec->spec;
+
+	if (!spec->hs.buttons)
+		return;
+	spec->hs.buttons = 0;
+	snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
+			    CS4208_VERB_HS_BTN_IRQ_MASK, 0);
+	cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS, 0x7000, 0);
+	if (spec->hs.btn_state) {
+		spec->hs.btn_state = 0;
+		snd_hda_jack_set_button_state(codec, CS4208_HP_PIN, 0);
+		snd_hda_jack_report_sync(codec);
+	}
+}
+
+/* unsolicited response of the button decoder (tag 0x2f) */
+static void cs4208_hs_button_event(struct hda_codec *codec, unsigned int res)
+{
+	struct cs_spec *spec = codec->spec;
+	int state;
+
+	mutex_lock(&spec->hs.lock);
+	if (!spec->hs.buttons)
+		goto out;
+	state = spec->hs.btn_state;
+	/* The centre button shorts the microphone line; its release comes while
+	 * the block identifies the remote again (bit 0x800), so these two are
+	 * handled whatever that bit says, as AppleHDA does. */
+	if (res & CS4208_HS_BTN_UR_SHORT) {
+		cs4208_hs_bias_autoclamp(codec, false);
+		state |= SND_JACK_BTN_0;
+	}
+	if ((res & CS4208_HS_BTN_UR_UNSHORT) && (state & SND_JACK_BTN_0)) {
+		msleep(10);
+		cs4208_hs_bias_autoclamp(codec, true);
+		state &= ~SND_JACK_BTN_0;
+	}
+	if (!(res & CS4208_HS_BTN_UR_IDENTIFYING)) {
+		if (res & CS4208_HS_BTN_UR_BTN2)
+			state |= SND_JACK_BTN_1;
+		if (res & CS4208_HS_BTN_UR_BTN1)
+			state |= SND_JACK_BTN_2;
+		if (res & CS4208_HS_BTN_UR_RELEASE)
+			state &= ~(SND_JACK_BTN_1 | SND_JACK_BTN_2);
+	}
+	if (state != spec->hs.btn_state) {
+		codec_dbg(codec, "headset buttons: 0x%08x -> state 0x%x\n", res, state);
+		spec->hs.btn_state = state;
+		snd_hda_jack_set_button_state(codec, CS4208_HP_PIN, state);
+		snd_hda_jack_report_sync(codec);
+	}
+out:
+	mutex_unlock(&spec->hs.lock);
+}
+
+/* after the jack controls exist: the key map of the headphone jack */
+static void cs4208_hs_bind_keys(struct hda_codec *codec)
+{
+	struct cs_spec *spec = codec->spec;
+
+	if (!spec->hs.enabled || !headset_buttons)
+		return;
+	if (snd_hda_jack_bind_keymap(codec, CS4208_HP_PIN, cs4208_hs_keymap,
+				     CS4208_HP_PIN) < 0)
+		codec_info(codec, "headset buttons: no jack for pin 0x10\n");
+}
+
 /* Apply the detector's verdict: 0 and 1 are the two headset pinouts, 2 and 3
  * mean no microphone.  Type 0 (CTIA, Apple EarPods) is verified on a
  * MacBook10,1; the line for type 1 follows AppleHDA. */
@@ -477,6 +618,10 @@ static void cs4208_hs_set_type(struct hda_codec *codec, int type)
 		cs4208_hs_coef_update(codec, CS4208_IDX_HS_BIAS,
 				      0x0172, 0x0112);
 	cs4208_hs_keep_power(codec, type < 2);
+	if (type < 2)
+		cs4208_hs_buttons_enable(codec);
+	else
+		cs4208_hs_buttons_disable(codec);
 }
 
 static void cs4208_hs_stop_detect(struct hda_codec *codec)
@@ -563,6 +708,7 @@ static void cs4208_hs_set_plugged(struct hda_codec *codec, bool plugged)
 	spec->hs.type = -1;
 	cancel_delayed_work(&spec->hs.work);
 	cs4208_hs_stop_detect(codec);
+	cs4208_hs_buttons_disable(codec);
 	if (plugged) {
 		snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
 				    CS4208_VERB_HS_BTN_IRQ_MASK, 0);
@@ -720,8 +866,7 @@ static void cs_4208_unsol_event(struct hda_codec *codec, unsigned int res)
 		return;
 	}
 	if (spec->hs.enabled && tag == CS4208_HS_BTN_UNSOL_TAG) {
-		/* headset buttons: not decoded yet, keep the raw response visible */
-		codec_info(codec, "headset button response 0x%08x\n", res);
+		cs4208_hs_button_event(codec, res);
 		return;
 	}
 	snd_hda_jack_unsol_event(codec, res);
