@@ -19,7 +19,7 @@ Based on davidjo's [snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbo
 - Volume control — needs one extra config step, see [Speaker volume](#3-speaker-volume-required)
 - Internal microphone
 - Headset microphone in the combo jack (TRRS, e.g. Apple EarPods), with automatic
-  internal / headset microphone switching — see [Microphone boost](#4-microphone-boost-recommended)
+  internal / headset microphone switching — see [Microphone levels](#4-microphone-levels-recommended)
 - Headset remote buttons (play/pause, volume up/down) as media keys
 
 ## Supported hardware & kernels
@@ -136,20 +136,25 @@ systemctl --user restart wireplumber
 > config matches. If yours differs, find the card name with
 > `wpctl status` or `pactl list cards short`.
 
-### 4. Microphone boost (recommended)
+### 4. Microphone levels (recommended)
 
-Both microphone boost amplifiers (`Internal Mic Boost`, `Mic Boost` for the
-headset microphone) default to 0, which leaves the headset microphone at
--20 dB. They are also **reset to 0 whenever WirePlumber applies its ALSA card
-profile paths** — on every microphone port change and at every WirePlumber
-start, including the display manager's own instance at boot: the paths switch
-the unused boost off, and with the software mixer from step 3 nothing turns it
-back on.
+With the software mixer from step 3 WirePlumber never touches the codec's
+hardware capture controls, so they keep whatever they boot with. Two things
+follow:
+
+- The codec's `Capture` control may come up muted or at 0, which makes every
+  microphone silent — and `alsactl store` then preserves that state.
+- Both microphone boost amplifiers (`Internal Mic Boost`, `Mic Boost` for the
+  headset microphone) default to 0, which leaves the headset microphone at
+  -20 dB, and they are **reset to 0 whenever WirePlumber applies its ALSA card
+  profile paths** — on every microphone port change and at every WirePlumber
+  start, including the display manager's own instance at boot: the paths
+  switch the unused boost off, and nothing turns it back on.
 
 `contrib/mic-boost-setup.sh` installs a system-wide copy of those paths that
-leaves the boosts alone, points every WirePlumber instance at it, sets both
-boosts to a usable level (2 = 0 dB on the headset mic) and stores the ALSA
-mixer state:
+leaves the boosts alone, points every WirePlumber instance at it, opens
+`Capture` (100%, unmuted), sets both boosts to a usable level (2 = 0 dB on the
+headset mic) and stores the ALSA mixer state:
 ```bash
 sudo contrib/mic-boost-setup.sh       # or: sudo contrib/mic-boost-setup.sh --boost 3
 ```

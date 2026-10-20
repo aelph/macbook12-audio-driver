@@ -12,12 +12,18 @@
 # api.alsa.soft-mixer = true (required for the speakers, see the README)
 # nothing ever turns them back on.
 #
+# The codec's "Capture" control is not touched by WirePlumber either (the
+# software mixer leaves the hardware mixer alone), so a muted or zeroed
+# "Capture" — the state some machines boot with — makes every microphone
+# silent, and "alsactl store" then preserves it.
+#
 # This script, run as root:
 #   * installs a system-wide copy of the ACP mixer paths in which those two
 #     blocks are left alone ("ignore") and points every WirePlumber instance
 #     at it through ACP_PATHS_DIR in a systemd user-unit drop-in;
-#   * restarts the calling user's WirePlumber, sets both boosts to the given
-#     level and stores the ALSA mixer state.
+#   * restarts the calling user's WirePlumber, opens "Capture" (100%,
+#     unmuted), sets both boosts to the given level and stores the ALSA
+#     mixer state.
 #
 # Run it again after a PipeWire update to refresh the copied paths.
 #
@@ -128,6 +134,11 @@ EOF
     echo "WirePlumber instances now use the mixer paths in $dst_dir"
 
     [[ -n $card ]] || card="$(find_card)"
+    if amixer -c "$card" sset Capture 100% cap > /dev/null 2>&1; then
+      echo "Capture set to 100%, unmuted, on card $card"
+    else
+      echo "Control 'Capture' not found on card $card, skipped" >&2
+    fi
     for ctl in "Mic Boost" "Internal Mic Boost"; do
       if amixer -c "$card" sset "$ctl" "$boost" > /dev/null 2>&1; then
         echo "$ctl set to $boost on card $card"
