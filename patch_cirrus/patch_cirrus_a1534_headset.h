@@ -30,6 +30,11 @@ module_param(headset_buttons, bool, 0444);
 MODULE_PARM_DESC(headset_buttons,
 		 "CS4208 A1534: headset remote buttons as media keys (default=1)");
 
+static bool headset_redetect = true;
+module_param(headset_redetect, bool, 0644);
+MODULE_PARM_DESC(headset_redetect,
+		 "CS4208 A1534: detect the headset again after every headphone trace replay instead of restoring its state (default=1)");
+
 struct cs4208_hs {
 	struct hda_codec *codec;
 	struct mutex lock;		/* protects the state below */

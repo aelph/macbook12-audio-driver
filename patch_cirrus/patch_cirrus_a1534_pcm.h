@@ -6,12 +6,19 @@
 static unsigned int cs4208_cur_stream_tag;	/* running PCM stream tag (0 = none) */
 static unsigned int cs4208_cur_format;		/* running PCM HDA format word */
 static int cs4208_cur_hp = -1;			/* last HP jack state (-1 = unknown) */
+/* HP jack state the output path was last set up for by a trace replay
+ * (headphones_a1534 / play_a1534); -1 = unknown, e.g. after the codec slept.
+ * A PCM open with the route already set up skips the replay: the traces
+ * cycle the whole codec through D3, which pops into a running capture and
+ * resets the headset block. */
+static int cs4208_route_hp = -1;
 /* cs_4208_hp_jack_callback is defined further down, after get_hda_cvt_setup_4208,
  * which it needs to invalidate the converter format cache. */
 /* headset detection (A1534 combo jack), defined further down as well */
 static void cs4208_hs_jack_update(struct hda_codec *codec, bool plugged,
 				  bool replay);
 static void cs4208_hs_bind_keys(struct hda_codec *codec);
+static void cs_4208_rearm_capture_cvt(struct hda_codec *codec, hda_nid_t nid);
 
 static int cs_4208_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 					struct hda_codec *codec,
@@ -95,12 +102,26 @@ static int cs_4208_playback_pcm_open(struct hda_pcm_stream *hinfo,
 		if (hp_pin_sense) { // output to headphones
 			codec_dbg(codec, "cs_4208_playback_pcm_open playing to headphones");
 			hinfo->nid = 0x02; // headphone converter (DAC) -> HP pin 0x10
-			err = headphones_a1534(codec);
-			cs4208_hs_jack_update(codec, true, true);
+			if (cs4208_route_hp == 1) {
+				codec_dbg(codec, "cs_4208_playback_pcm_open route already set up, no replay");
+			} else {
+				err = headphones_a1534(codec);
+				cs4208_route_hp = 1;
+				/* the trace cycled the AFG through D3: a running capture
+				 * has lost its stream tag, see cs_4208_rearm_capture_cvt() */
+				cs_4208_rearm_capture_cvt(codec, 0x06);
+				cs_4208_rearm_capture_cvt(codec, 0x07);
+				cs4208_hs_jack_update(codec, true, true);
+			}
 		} else { // output to speakers
 			codec_dbg(codec, "cs_4208_playback_pcm_open playing to speakers");
 			hinfo->nid = 0x04; // speaker converter (DAC) -> speaker pin 0x1d
-			err = play_a1534(codec);
+			if (cs4208_route_hp == 0) {
+				codec_dbg(codec, "cs_4208_playback_pcm_open route already set up, no replay");
+			} else {
+				err = play_a1534(codec);
+				cs4208_route_hp = 0;
+			}
 		}
 	
 	//call_pcm_playback_hook(hinfo, codec, substream, HDA_GEN_PCM_ACT_OPEN);
@@ -183,9 +204,10 @@ void cs_4208_playback_pcm_hook(struct hda_pcm_stream *hinfo, struct hda_codec *c
 		//if (hp_pin_sense == 1) { // output to headphones
 		//	codec_dbg(codec, "cs_4208_playback_pcm_hook playing to headphones");
 		//}
-		if (hp_pin_sense == 0) { // output to speakers
+		if (hp_pin_sense == 0 && cs4208_route_hp != 0) { // output to speakers
 			//codec_dbg(codec, "cs_4208_playback_pcm_hook playing to speakers");
         		err = play_a1534(codec);
+			cs4208_route_hp = 0;
 		}
 
 		//if (!spec->play_init) {
@@ -730,8 +752,33 @@ static void cs4208_hs_set_plugged(struct hda_codec *codec, bool plugged)
 	}
 }
 
+/* A replayed headphones_a1534() left the block in its plain-headphones state
+ * (both FETs low, bias and button reception off): put the known verdict back
+ * without detecting again.  Called with hs.lock held. */
+static void cs4208_hs_reapply(struct hda_codec *codec)
+{
+	struct cs_spec *spec = codec->spec;
+	int type = spec->hs.type;
+
+	codec_dbg(codec, "headset: restoring type %d after a trace replay\n", type);
+	snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
+			    CS4208_VERB_HS_BTN_IRQ_MASK, 0);
+	snd_hda_codec_write(codec, CS4208_VENDOR_NID, 0,
+			    CS4208_VERB_HS_IRQ_MASK, 0xae);
+	spec->hs.buttons = 0;		/* the trace dropped it; set it up again */
+	if (type < 2) {
+		snd_hda_codec_write(codec, CS4208_HS_MIC_PIN, 0,
+				    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+		snd_hda_codec_write(codec, CS4208_HS_MIC_PIN, 0,
+				    AC_VERB_SET_PIN_WIDGET_CONTROL,
+				    PIN_IN | AC_PINCTL_VREF_80);
+	}
+	cs4208_hs_set_type(codec, type);
+}
+
 /* The combo jack was plugged or unplugged, or a trace replay reset the headset
- * block (@replay): a plugged jack is detected again either way. */
+ * block (@replay): a plugged jack is detected again, or its known state is
+ * restored (headset_redetect=0). */
 static void cs4208_hs_jack_update(struct hda_codec *codec, bool plugged,
 				  bool replay)
 {
@@ -740,8 +787,14 @@ static void cs4208_hs_jack_update(struct hda_codec *codec, bool plugged,
 	if (!spec->hs.enabled)
 		return;
 	mutex_lock(&spec->hs.lock);
-	if (plugged != spec->hs.plugged || (plugged && replay))
+	if (plugged != spec->hs.plugged)
 		cs4208_hs_set_plugged(codec, plugged);
+	else if (plugged && replay) {
+		if (headset_redetect || spec->hs.type < 0)
+			cs4208_hs_set_plugged(codec, plugged);
+		else
+			cs4208_hs_reapply(codec);
+	}
 	mutex_unlock(&spec->hs.lock);
 }
 
@@ -875,6 +928,7 @@ static void cs_4208_unsol_event(struct hda_codec *codec, unsigned int res)
 static int cs_4208_suspend(struct hda_codec *codec)
 {
 	cs4208_hs_stop(codec, false);
+	cs4208_route_hp = -1;
 	return 0;
 }
 
@@ -895,6 +949,7 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 
 	if (hp) {				/* headphones plugged */
 		headphones_a1534(codec);
+		cs4208_route_hp = 1;
 		cs_4208_rearm_capture_cvt(codec, 0x06);	/* internal mic ADC */
 		cs_4208_rearm_capture_cvt(codec, 0x07);	/* external mic ADC */
 		if (cs4208_cur_stream_tag) {
@@ -916,6 +971,7 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 		cs4208_hs_jack_update(codec, true, true);
 	} else {				/* back to speakers */
 		play_a1534(codec);
+		cs4208_route_hp = 0;
 		cs_4208_rearm_capture_cvt(codec, 0x06);
 		cs_4208_rearm_capture_cvt(codec, 0x07);
 		if (cs4208_cur_stream_tag) {
@@ -976,6 +1032,7 @@ static int cs_4208_resume(struct hda_codec *codec)
 	if (codec->core.dev.power.power_state.event != PM_EVENT_ON) {
 		setup_a1534(codec);
 		play_a1534(codec);
+		cs4208_route_hp = 0;
 		/* No jack event follows a system resume, so the output would
 		 * stay on the speakers until the next PCM open.  Route plugged
 		 * headphones now; the headset detector also only answers
