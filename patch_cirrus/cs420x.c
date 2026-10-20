@@ -733,6 +733,14 @@ static int cs4208_probe(struct hda_codec *codec)
 	struct cs_spec *spec = codec->spec;
 	int err;
 
+	/* The codec device outlives a driver rebind and keeps the fixup chosen
+	 * by the previous driver, whose table may be gone with its module;
+	 * snd_hda_pick_fixup() would then keep that stale pointer.  Start
+	 * clean. */
+	codec->fixup_id = HDA_FIXUP_ID_NOT_SET;
+	codec->fixup_list = NULL;
+	codec->fixup_name = NULL;
+
 	/* exclude NID 0x10 (HP) from output volumes due to different steps */
 	spec->gen.out_vol_mask = 1ULL << 0x10;
 

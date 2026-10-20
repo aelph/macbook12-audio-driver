@@ -12,6 +12,16 @@ static int cs4208_cur_hp = -1;			/* last HP jack state (-1 = unknown) */
  * cycle the whole codec through D3, which pops into a running capture and
  * resets the headset block. */
 static int cs4208_route_hp = -1;
+/* HP jack state when the codec was last suspended: a plug or unplug while
+ * the codec slept may not reach the jack callback (seen on 6.12), so the
+ * resume compares and runs the callback itself when the state changed. */
+static int cs4208_sleep_hp = -1;
+/* set while cs_4208_hp_jack_callback() runs: its first verb may resume the
+ * codec, and the resume must not run the callback a second time */
+static bool cs4208_in_jack_cb;
+/* set while cs_4208_resume() runs the jack callback itself: the codec is
+ * still formally resuming then, but that caller is the resume */
+static bool cs4208_from_resume;
 /* cs_4208_hp_jack_callback is defined further down, after get_hda_cvt_setup_4208,
  * which it needs to invalidate the converter format cache. */
 /* headset detection (A1534 combo jack), defined further down as well */
@@ -434,11 +444,28 @@ static void cs_4208_rearm_capture_cvt(struct hda_codec *codec, hda_nid_t nid)
 #define CS4208_HS_DETECT_TIMEOUT	1000	/* ms */
 #define CS4208_HS_MAX_RETRIES		4
 
-/* the jack table is stale during a resume, so ask the codec itself */
+/* The jack table is stale during a resume, so ask the codec itself.  The
+ * core helper powers the pin up for the read: with per-node power saving
+ * the pin may still be in D3 right after a runtime resume, and a raw
+ * GET_PIN_SENSE then reports nothing plugged. */
 static bool cs4208_hp_plugged(struct hda_codec *codec)
 {
-	return snd_hda_codec_read(codec, CS4208_HP_PIN, 0,
-				  AC_VERB_GET_PIN_SENSE, 0) & AC_PINSENSE_PRESENCE;
+	unsigned int power, sense;
+
+	power = snd_hda_codec_read(codec, CS4208_HP_PIN, 0,
+				   AC_VERB_GET_POWER_STATE, 0);
+	if ((power & 0x0f) != AC_PWRST_D0) {
+		snd_hda_codec_write(codec, CS4208_HP_PIN, 0,
+				    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+		msleep(10);
+	}
+	snd_hda_jack_set_dirty_all(codec);
+	sense = snd_hda_jack_pin_sense(codec, CS4208_HP_PIN, 0);
+	if ((power & 0x0f) != AC_PWRST_D0)
+		snd_hda_codec_write(codec, CS4208_HP_PIN, 0,
+				    AC_VERB_SET_POWER_STATE, power & 0x0f);
+	codec_dbg(codec, "hp pin sense 0x%08x (pin power 0x%x)\n", sense, power);
+	return sense & AC_PINSENSE_PRESENCE;
 }
 
 static void cs4208_hs_coef_update(struct hda_codec *codec, unsigned int idx,
@@ -684,6 +711,10 @@ static void cs4208_hs_work(struct work_struct *work)
 	struct hda_codec *codec = hs->codec;
 	struct cs_spec *spec = codec->spec;
 
+	/* Wake the codec before taking the lock: a resume runs the codec init,
+	 * and cs4208_hs_init() takes this lock as well (self-deadlock seen when
+	 * the detection started while the codec was runtime-suspended). */
+	snd_hda_power_up_pm(codec);
 	mutex_lock(&spec->hs.lock);
 	if (spec->hs.detecting) {
 		/* no answer: handle it as headphones */
@@ -695,6 +726,7 @@ static void cs4208_hs_work(struct work_struct *work)
 		cs4208_hs_start_detect(codec);
 	}
 	mutex_unlock(&spec->hs.lock);
+	snd_hda_power_down_pm(codec);
 }
 
 /* unsolicited response of the headset detector */
@@ -807,6 +839,7 @@ static void cs4208_hs_init(struct hda_codec *codec)
 	if (!spec->hs.enabled)
 		return;
 	plugged = cs4208_hp_plugged(codec);
+	codec_dbg(codec, "headset init: plugged=%d was=%d type=%d\n", plugged, spec->hs.plugged, spec->hs.type);
 	mutex_lock(&spec->hs.lock);
 	if (plugged && spec->hs.plugged && spec->hs.type >= 2) {
 		/* The same headphones as before the power-down: nothing to
@@ -830,7 +863,13 @@ static void cs4208_hs_stop(struct hda_codec *codec, bool release)
 
 	if (!spec->hs.enabled)
 		return;
-	cancel_delayed_work_sync(&spec->hs.work);
+	/* From the suspend path the work must not be waited for: it may be
+	 * blocked in snd_hda_power_up_pm() until this very suspend completes.
+	 * Left pending, it simply wakes the codec again and detects. */
+	if (release)
+		cancel_delayed_work_sync(&spec->hs.work);
+	else
+		cancel_delayed_work(&spec->hs.work);
 	mutex_lock(&spec->hs.lock);
 	if (spec->hs.detecting) {
 		spec->hs.detecting = 0;
@@ -929,6 +968,8 @@ static int cs_4208_suspend(struct hda_codec *codec)
 {
 	cs4208_hs_stop(codec, false);
 	cs4208_route_hp = -1;
+	cs4208_sleep_hp = snd_hda_jack_detect(codec, CS4208_HP_PIN) ? 1 : 0;
+	codec_dbg(codec, "cs_4208_suspend hp=%d\n", cs4208_sleep_hp);
 	return 0;
 }
 
@@ -945,6 +986,19 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 		  hp, cs4208_cur_hp, cs4208_cur_stream_tag);
 	if (hp == cs4208_cur_hp)
 		return;
+	/* A jack event that wakes a runtime-suspended codec is delivered while
+	 * the resume is still in progress in another thread (seen on 6.12):
+	 * a trace replayed now runs in parallel with the core's resume and is
+	 * undone by its register sync.  Leave it to cs_4208_resume(), which
+	 * compares the jack state with the one at suspend and runs this
+	 * callback itself once the codec is up. */
+	if (snd_hdac_is_in_pm(&codec->core) && !cs4208_from_resume) {
+		codec_dbg(codec, "cs_4208_hp_jack_callback: codec resuming, deferred\n");
+		return;
+	}
+	cs4208_in_jack_cb = true;
+	/* a sleeping codec would only cache the verbs: wake it first */
+	snd_hda_power_up_pm(codec);
 	cs4208_cur_hp = hp;
 
 	if (hp) {				/* headphones plugged */
@@ -983,6 +1037,8 @@ static void cs_4208_hp_jack_callback(struct hda_codec *codec,
 		}
 		cs4208_hs_jack_update(codec, false, false);
 	}
+	snd_hda_power_down_pm(codec);
+	cs4208_in_jack_cb = false;
 }
 
 static int cs_4208_init_explicit(struct hda_codec *codec)
@@ -1010,8 +1066,14 @@ static int cs_4208_init_explicit(struct hda_codec *codec)
 
 static void cs_4208_free_explicit(struct hda_codec *codec)
 {
+	struct cs_spec *spec = codec->spec;
+
 	cs4208_hs_stop(codec, true);
-	kfree(codec->spec);
+	/* the codec device outlives the module: put the core's verb executor
+	 * back, or the next probe calls into unloaded code */
+	if (spec->hs.exec_verb)
+		codec->core.exec_verb = spec->hs.exec_verb;
+	kfree(spec);
 }
 
 static int cs_4208_resume(struct hda_codec *codec)
@@ -1049,6 +1111,21 @@ static int cs_4208_resume(struct hda_codec *codec)
 		return err;
 
 	snd_hda_regmap_sync(codec);
+
+	/* a jack change while the codec slept: act on it as the callback would */
+	if (codec->core.dev.power.power_state.event == PM_EVENT_ON &&
+	    cs4208_sleep_hp >= 0 && !cs4208_in_jack_cb) {
+		int hp = cs4208_hp_plugged(codec) ? 1 : 0;
+
+		codec_dbg(codec, "cs_4208_resume hp=%d (asleep with %d)\n", hp, cs4208_sleep_hp);
+		if (hp != cs4208_sleep_hp) {
+			snd_hda_jack_set_dirty_all(codec);
+			cs4208_cur_hp = -1;
+			cs4208_from_resume = true;
+			cs_4208_hp_jack_callback(codec, NULL);
+			cs4208_from_resume = false;
+		}
+	}
 	return 0;
 }
 

@@ -785,6 +785,14 @@ static int patch_cs4208(struct hda_codec *codec)
 	struct cs_spec *spec;
 	int err;
 
+	/* The codec device outlives a driver rebind and keeps the fixup chosen
+	 * by the previous driver, whose table may be gone with its module;
+	 * snd_hda_pick_fixup() would then keep that stale pointer.  Start
+	 * clean. */
+	codec->fixup_id = HDA_FIXUP_ID_NOT_SET;
+	codec->fixup_list = NULL;
+	codec->fixup_name = NULL;
+
 	spec = cs_alloc_spec(codec, CS4208_VENDOR_NID);
 	if (!spec)
 		return -ENOMEM;
