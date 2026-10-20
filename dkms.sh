@@ -24,6 +24,9 @@ install_driver() {
   if dkms status -m "$module_name" -v "$module_version" 2>/dev/null | grep -q .; then
     dkms remove -m "$module_name" -v "$module_version" --all
   fi
+  # dkms may keep modules built for other kernels and reuse them on the next
+  # install; they would be stale after a source update
+  rm -rf -- "/var/lib/dkms/${module_name}"
 
   rm -rf -- "$source_dir"
   install -d -m 0755 "$source_dir"
@@ -36,6 +39,15 @@ install_driver() {
   cp -a "$script_dir/patch_cirrus" "$source_dir"
 
   dkms install -m "$module_name" -v "$module_version" --force
+
+  # the other installed kernels with headers: build for them too, so that
+  # switching kernels does not leave the stock module in place
+  local k
+  for k in /lib/modules/*/; do
+    k="${k%/}"; k="${k##*/}"
+    [[ $k == "$(uname -r)" || ! -e /lib/modules/$k/build/Makefile ]] && continue
+    dkms install -m "$module_name" -v "$module_version" -k "$k" --force || echo "Build for $k failed, see /var/lib/dkms/$module_name/$module_version/build/make.log" >&2
+  done
 }
 
 case "$action" in

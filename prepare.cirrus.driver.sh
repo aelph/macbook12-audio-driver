@@ -181,13 +181,16 @@ if (( major_version > 6 || (major_version == 6 && minor_version >= 17) )); then
   sed -i 's/\.free/.remove/' "$hda_dir/codecs/cirrus/patch_cirrus_a1534_pcm.h"
 fi
 
-if (( major_version == 6 && minor_version >= 12 && minor_version < 17 )); then
-  sed -i 's/snd_pci_quirk/hda_quirk/' "$hda_dir/patch_cirrus.c"
-  sed -i 's/SND_PCI_QUIRK\b/HDA_CODEC_QUIRK/' "$hda_dir/patch_cirrus.c"
-fi
-
-if (( major_version == 6 && minor_version <= 11 )); then
-  sed -i 's/hda_quirk/snd_pci_quirk/' "$hda_dir/patch_cirrus.c"
+# The quirk table type of snd_hda_pick_fixup() changed from snd_pci_quirk to
+# hda_quirk in 6.13 and was backported to the 6.6 and 6.1 stable series, so
+# look at the kernel's own header instead of the version number.
+if (( major_version < 6 || (major_version == 6 && minor_version < 17) )); then
+  if grep -q 'const struct hda_quirk \*quirk' "$hda_dir/hda_local.h"; then
+    sed -i 's/snd_pci_quirk/hda_quirk/' "$hda_dir/patch_cirrus.c"
+    sed -i 's/SND_PCI_QUIRK\b/HDA_CODEC_QUIRK/' "$hda_dir/patch_cirrus.c"
+  else
+    sed -i 's/hda_quirk/snd_pci_quirk/' "$hda_dir/patch_cirrus.c"
+  fi
 fi
 
 if (( major_version < 5 || (major_version == 5 && minor_version < 6) )); then
