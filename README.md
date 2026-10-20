@@ -140,19 +140,22 @@ systemctl --user restart wireplumber
 
 Both microphone boost amplifiers (`Internal Mic Boost`, `Mic Boost` for the
 headset microphone) default to 0, which leaves the headset microphone at
--20 dB. They are also **reset to 0 on every microphone port change**: WirePlumber's
-ALSA card profile paths switch the unused boost off, and with the software
-mixer from step 3 nothing turns it back on.
+-20 dB. They are also **reset to 0 whenever WirePlumber applies its ALSA card
+profile paths** — on every microphone port change and at every WirePlumber
+start, including the display manager's own instance at boot: the paths switch
+the unused boost off, and with the software mixer from step 3 nothing turns it
+back on.
 
-`contrib/mic-boost-setup.sh` installs a per-user copy of those paths that leaves
-the boosts alone, sets both to a usable level (2 = 0 dB on the headset mic) and
-stores the ALSA mixer state:
+`contrib/mic-boost-setup.sh` installs a system-wide copy of those paths that
+leaves the boosts alone, points every WirePlumber instance at it, sets both
+boosts to a usable level (2 = 0 dB on the headset mic) and stores the ALSA
+mixer state:
 ```bash
-contrib/mic-boost-setup.sh            # or: contrib/mic-boost-setup.sh --boost 3
+sudo contrib/mic-boost-setup.sh       # or: sudo contrib/mic-boost-setup.sh --boost 3
 ```
 
 Run it again after a PipeWire update to refresh the copied paths;
-`contrib/mic-boost-setup.sh remove` undoes it.
+`sudo contrib/mic-boost-setup.sh remove` undoes it.
 
 ## Verifying
 
