@@ -18,6 +18,9 @@ Based on davidjo's [snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbo
 - Automatic speaker / headphone switching on plug / unplug
 - Volume control — needs one extra config step, see [Speaker volume](#3-speaker-volume-required)
 - Internal microphone
+- Headset microphone in the combo jack (TRRS, e.g. Apple EarPods), with automatic
+  internal / headset microphone switching — see [Microphone boost](#4-microphone-boost-recommended)
+- Headset remote buttons (play/pause, volume up/down) as media keys
 
 ## Supported hardware & kernels
 
@@ -133,6 +136,24 @@ systemctl --user restart wireplumber
 > config matches. If yours differs, find the card name with
 > `wpctl status` or `pactl list cards short`.
 
+### 4. Microphone boost (recommended)
+
+Both microphone boost amplifiers (`Internal Mic Boost`, `Mic Boost` for the
+headset microphone) default to 0, which leaves the headset microphone at
+-20 dB. They are also **reset to 0 on every microphone port change**: WirePlumber's
+ALSA card profile paths switch the unused boost off, and with the software
+mixer from step 3 nothing turns it back on.
+
+`contrib/mic-boost-setup.sh` installs a per-user copy of those paths that leaves
+the boosts alone, sets both to a usable level (2 = 0 dB on the headset mic) and
+stores the ALSA mixer state:
+```bash
+contrib/mic-boost-setup.sh            # or: contrib/mic-boost-setup.sh --boost 3
+```
+
+Run it again after a PipeWire update to refresh the copied paths;
+`contrib/mic-boost-setup.sh remove` undoes it.
+
 ## Verifying
 
 ```bash
@@ -154,6 +175,16 @@ doesn't bleed while headphones are in).
 
 - Switching is done at the codec level and cooperates with PipeWire's own jack
   handling.
+- The **headset microphone** uses the codec's headset block behind the vendor
+  widget `0x24` (worked out for the MacBookPro11,x by
+  [mbp11-3-sound](https://github.com/IgorChicherin/mbp11-3-sound) and adapted
+  here): on a plug event the driver runs the codec's headset type detection,
+  sets the two GPIO-driven FETs that otherwise ground the microphone contact and
+  reports the result as the presence of pin `0x18`, so the usual "Mic Jack"
+  auto-switching applies. The codec stays powered while a headset with a
+  microphone is plugged in. The headset block also decodes the Apple remote; its
+  buttons are reported as keys of the `HDA Intel PCH Headphone` input device.
+  Module parameters `headset_mic=0` / `headset_buttons=0` turn either part off.
 - Because the speaker relies on software volume, **very low headphone levels can
   sound slightly compressed** (reduced effective bit depth). Normal listening
   levels are unaffected.
